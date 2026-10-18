@@ -1333,13 +1333,21 @@ function Sources:list(force)
   end
 
   if self.me then
+    -- Some AE2/OC builds return nil instead of an empty table when the
+    -- network has no item inventory (for example a fluids-only network).
+    -- Retry with an explicit empty filter before treating it as "no items".
     local okItems, items = pcall(self.me.getItemsInNetwork)
-    if not okItems then
+    if not okItems or type(items) ~= "table" then
       local okRetry, retry = pcall(self.me.getItemsInNetwork, {})
-      if okRetry then
+      if okRetry and type(retry) == "table" then
         items = retry
-      else
+        okItems = true
+      elseif not okItems then
         self.scanError = "items: " .. tostring(items)
+      else
+        -- nil is a valid "no item storage" response; do not mark the whole
+        -- source as broken. Fluids/power can still be listed below.
+        items = nil
       end
     end
 
@@ -1360,8 +1368,6 @@ function Sources:list(force)
           end
         end
       end
-    else
-      if not self.scanError then self.scanError = "items: invalid response" end
     end
 
     local okFluids, fluids = pcall(self.me.getFluidsInNetwork)
@@ -1460,13 +1466,21 @@ function Sources:sample(meta, now)
 
     local ok, list = pcall(self.me.getItemsInNetwork, filter)
     if not ok or type(list) ~= "table" then
-      -- Some AE2/OC combinations do not accept a filter. Fall back to a full
-      -- scan, which is slower but always available.
-      local okAll, all = pcall(self.me.getItemsInNetwork)
-      if not okAll or type(all) ~= "table" then
-        return nil, nil, "getItemsInNetwork failed"
+      -- Some AE2/OC builds behave differently for filtered calls, and some
+      -- return nil for a network without item storage. Try an explicit empty
+      -- filter, then a full scan, before reporting an error.
+      local okRetry, retry = pcall(self.me.getItemsInNetwork, {})
+      if okRetry and type(retry) == "table" then
+        list = retry
+      elseif ok and list == nil then
+        list = {}
+      else
+        local okAll, all = pcall(self.me.getItemsInNetwork)
+        if not okAll or type(all) ~= "table" then
+          return nil, nil, "getItemsInNetwork failed"
+        end
+        list = all
       end
-      list = all
     end
 
     local total = 0
@@ -2908,6 +2922,16 @@ function App:selectInitial()
     if sourceMeta then meta = self:mergeMeta(meta, sourceMeta) end
   end
 
+  -- A demo resource can get saved as the selected resource when the computer
+  -- started without AE2. Once AE2 is connected, do not keep restoring that
+  -- synthetic selection unless demo mode was explicitly requested with
+  -- --demo or config.demo = true.
+  if meta and meta.kind == "demo" and self.config.demo ~= true
+    and self.sources and self.sources:isAE2()
+  then
+    meta = nil
+  end
+
   if not meta then
     for i = 1, #self.pickerItems do
       if self.pickerItems[i].kind == "item" then meta = self.pickerItems[i]; break end
@@ -2942,8 +2966,23 @@ function App:sourceName()
     return "AE2 offline"
   end
   if meta.kind == "custom" then return "custom" end
-  if meta.kind == "demo" then return "demo" end
+  if meta.kind == "demo" then
+    if self.sources and self.sources:isAE2() then return "demo" end
+    return "demo (no AE2)"
+  end
   return self.sources and self.sources:sourceName() or "?"
+end
+
+function App:hasRealSource()
+  for i = 1, #self.pickerItems do
+    local kind = self.pickerItems[i].kind
+    if kind == "item" or kind == "fluid" or kind == "power" then return true end
+  end
+  return false
+end
+
+function App:demoForced()
+  return self.config.demo == true
 end
 
 function App:currentValue()
@@ -3182,6 +3221,9 @@ function App:openPicker()
   self.state.picker.loading = false
   self.state.picker.selected = 1
   self.state.picker.scroll = 1
+  if not self.sources:isAE2() and not self:demoForced() then
+    self:toast("AE2 not detected - only demo/custom sources are listed", "error")
+  end
   self.dirty = true
 end
 
@@ -3196,6 +3238,9 @@ function App:refreshPicker()
   self.scanError = err
   self.state.picker.loading = false
   self.state.picker.selected = 1
+  if not self.sources:isAE2() and not self:demoForced() then
+    self:toast("AE2 not detected - only demo/custom sources are listed", "error")
+  end
   self.dirty = true
 end
 
@@ -3665,6 +3710,15 @@ function App:run()
   self.sources = Sources.new(self.config)
   self:refreshStartup()
   self:selectInitial()
+
+  local selectedKind = self.state.selected and self.state.selected.kind or nil
+  if not self:demoForced() and (selectedKind == nil or selectedKind == "demo") then
+    if not self.sources:isAE2() then
+      self:toast("No AE2 component found - demo mode. Press T to pick.", "error")
+    elseif not self:hasRealSource() then
+      self:toast("AE2 connected but no items/fluids/power - demo mode.", "error")
+    end
+  end
 
   self.nextSampleAt = self:now()
   self.lastSave = self:now()
