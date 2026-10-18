@@ -1139,6 +1139,14 @@ local function shortAddress(address)
   return address:sub(1, 4)
 end
 
+-- component.methods() returns method names as keys, and a boolean value that
+-- indicates whether the method is *direct*. A value of false still means the
+-- method exists; checking truthiness here would incorrectly reject AE2
+-- components whose callbacks are not direct.
+local function hasMethod(methods, name)
+  return type(methods) == "table" and methods[name] ~= nil
+end
+
 local function newMeta(kind, key, label, unit, extra)
   local meta = {
     kind = kind,
@@ -1177,13 +1185,12 @@ function Sources:detect(force)
   local function addCandidate(address, typ)
     if not address then return end
     local ok, methods = pcall(component.methods, address)
-    if ok and type(methods) == "table" then
-      candidates[#candidates + 1] = {
-        address = address,
-        type = typ,
-        methods = methods,
-      }
-    end
+    if not ok or type(methods) ~= "table" then methods = {} end
+    candidates[#candidates + 1] = {
+      address = address,
+      type = typ,
+      methods = methods,
+    }
   end
 
   if self.cfg.meAddress then
@@ -1210,7 +1217,19 @@ function Sources:detect(force)
   for i = 1, #candidates do
     local c = candidates[i]
     if c.type == "me_interface" or c.type == "me_controller" then
-      if c.methods.getItemsInNetwork or c.methods.getFluidsInNetwork or c.methods.getStoredPower then
+      local has = hasMethod(c.methods, "getItemsInNetwork")
+        or hasMethod(c.methods, "getFluidsInNetwork")
+        or hasMethod(c.methods, "getStoredPower")
+      if not has then
+        -- Fallback for components whose methods table is unavailable/empty.
+        local okProxy, proxy = pcall(component.proxy, c.address)
+        if okProxy and proxy then
+          has = proxy.getItemsInNetwork ~= nil
+            or proxy.getFluidsInNetwork ~= nil
+            or proxy.getStoredPower ~= nil
+        end
+      end
+      if has then
         chosen = c
         break
       end
@@ -1247,6 +1266,14 @@ function Sources:refresh()
   self.cached = nil
   self:detect(true)
   return self:list(true)
+end
+
+function Sources:hasMethod(name)
+  if hasMethod(self.methods, name) then return true end
+  -- Some OC builds do not list every environment callback in
+  -- component.methods(), even though the proxy exposes it. Fall back to the
+  -- proxy field itself.
+  return self.me ~= nil and self.me[name] ~= nil
 end
 
 function Sources:sourceName()
@@ -1390,7 +1417,7 @@ function Sources:list(force)
       if not self.scanError then self.scanError = "fluids: invalid response" end
     end
 
-    if self.cfg.includePower ~= false and self.methods and self.methods.getStoredPower then
+    if self.cfg.includePower ~= false and self:hasMethod("getStoredPower") then
       local okPower, stored = pcall(self.me.getStoredPower)
       if okPower and util.isFinite(tonumber(stored)) then
         local okMax, maxPower = pcall(self.me.getMaxStoredPower)
@@ -1502,7 +1529,7 @@ function Sources:sample(meta, now)
     if not self.me then self:detect(true) end
     if not self.me then return nil, nil, "AE2 offline" end
 
-    if self.methods and self.methods.getFluidInNetwork then
+    if self:hasMethod("getFluidInNetwork") then
       local ok, stack = pcall(self.me.getFluidInNetwork, meta.name)
       if ok then
         if type(stack) == "table" then
